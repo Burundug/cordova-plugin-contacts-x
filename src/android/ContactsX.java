@@ -15,9 +15,6 @@ import android.net.Uri;
 import android.os.RemoteException;
 import android.provider.ContactsContract;
 
-import com.google.i18n.phonenumbers.NumberParseException;
-import com.google.i18n.phonenumbers.PhoneNumberUtil;
-import com.google.i18n.phonenumbers.Phonenumber;
 
 import org.apache.cordova.CordovaPlugin;
 import org.apache.cordova.CallbackContext;
@@ -50,6 +47,17 @@ public class ContactsX extends CordovaPlugin {
     public static final int REQ_CODE_PICK = 2;
 
     private PhoneNumberUtil phoneUtil = PhoneNumberUtil.getInstance();
+
+    private static final Map<String, String> dbMap = new HashMap<String, String>();
+
+    static {
+        dbMap.put("displayName", ContactsContract.Contacts.DISPLAY_NAME);
+        dbMap.put("phoneNumbers", ContactsContract.CommonDataKinds.Phone.NUMBER);
+        dbMap.put("phoneNumbers.value", ContactsContract.CommonDataKinds.Phone.NUMBER);
+        dbMap.put("emails", ContactsContract.CommonDataKinds.Email.DATA);
+        dbMap.put("emails.value", ContactsContract.CommonDataKinds.Email.DATA);
+    }
+
 
     @Override
     public boolean execute(String action, JSONArray args, CallbackContext callbackContext) {
@@ -128,9 +136,21 @@ public class ContactsX extends CordovaPlugin {
         this.hasPermission();
     }
 
+
     private void find(JSONArray args) throws JSONException {
+        String searchTerm = "";
+        boolean hasPhoneNumber = true;
         ContactsXFindOptions options = new ContactsXFindOptions(args.optJSONObject(0));
 
+        searchTerm = options.filter;
+        if (searchTerm.length() == 0) {
+            searchTerm = "%";
+        }
+        else {
+            searchTerm = "%" + searchTerm + "%";
+        }
+
+        String finalSearchTerm = searchTerm;
         this.cordova.getThreadPool().execute(() -> {
 
             ContentResolver contentResolver = this.cordova.getContext().getContentResolver();
@@ -146,15 +166,15 @@ public class ContactsX extends CordovaPlugin {
                 }
             }
             String selection = ContactsContract.Data.MIMETYPE + " in (" + questionMarks.toString() + ")";
-
+            WhereOptions whereOptions = buildWhereClause(options, finalSearchTerm, hasPhoneNumber);
             Cursor contactsCursor = contentResolver.query(
                     ContactsContract.Data.CONTENT_URI,
                     projection.toArray(new String[0]),
-                    selection,
-                    selectionArgs.toArray(new String[0]),
-                    null
+                    whereOptions.getWhere(),
+                    whereOptions.getWhereArgs(),
+                    ContactsContract.Data.CONTACT_ID + " ASC"
             );
-
+            LOG.d(LOG_TAG, "How many fields do we have = " + contactsCursor);
             JSONArray result = null;
             try {
                 result = handleFindResult(contactsCursor, options);
@@ -164,6 +184,84 @@ public class ContactsX extends CordovaPlugin {
 
             this._callbackContext.success(result);
         });
+    }
+
+    private boolean isWildCardSearch(JSONArray fields) {
+        // Only do a wildcard search if we are passed ["*"]
+        if (fields.length() == 1) {
+            try {
+                if ("*".equals(fields.getString(0))) {
+                    return true;
+                }
+            } catch (JSONException e) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private WhereOptions buildWhereClause(ContactsXFindOptions fields, String searchTerm, boolean hasPhoneNumber) {
+
+        ArrayList<String> where = new ArrayList<String>();
+        ArrayList<String> whereArgs = new ArrayList<String>();
+
+        WhereOptions options = new WhereOptions();
+
+        if ("%".equals(searchTerm) && !hasPhoneNumber) {
+            options.setWhere("(" + ContactsContract.Contacts.DISPLAY_NAME + " LIKE ? )");
+            options.setWhereArgs(new String[] { searchTerm });
+            return options;
+        }else if(!("%".equals(searchTerm))){
+
+            if (fields.displayName) {
+                where.add("(" + dbMap.get("displayName") + " LIKE ? )");
+                whereArgs.add(searchTerm);
+            }
+            else if (fields.phoneNumbers) {
+                where.add("(" + dbMap.get("phoneNumbers") + " LIKE ? AND "
+                        + ContactsContract.Data.MIMETYPE + " = ? )");
+                whereArgs.add(searchTerm);
+                whereArgs.add(ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE);
+            }
+            else if (fields.emails) {
+                where.add("(" + dbMap.get("emails") + " LIKE ? AND "
+                        + ContactsContract.Data.MIMETYPE + " = ? )");
+                whereArgs.add(searchTerm);
+                whereArgs.add(ContactsContract.CommonDataKinds.Email.CONTENT_ITEM_TYPE);
+            }
+        }
+
+
+        StringBuffer selection = new StringBuffer();
+        for (int i = 0; i < where.size(); i++) {
+            selection.append(where.get(i));
+            if (i != (where.size() - 1)) {
+                selection.append(" OR ");
+            }
+        }
+
+
+        if(hasPhoneNumber){
+            if(where.size()>0){
+                selection.insert(0,"(");
+                selection.append(") AND (" + ContactsContract.Contacts.HAS_PHONE_NUMBER + " = ?)");
+                whereArgs.add("1");
+            }else{
+                selection.append("(" + ContactsContract.Contacts.HAS_PHONE_NUMBER + " = ?)");
+                whereArgs.add("1");
+            }
+        }
+
+        options.setWhere(selection.toString());
+
+
+        String[] selectionArgs = new String[whereArgs.size()];
+        for (int i = 0; i < whereArgs.size(); i++) {
+            selectionArgs[i] = whereArgs.get(i);
+        }
+        options.setWhereArgs(selectionArgs);
+
+        return options;
     }
 
     private ArrayList<String> getProjection(ContactsXFindOptions options) {
@@ -218,7 +316,7 @@ public class ContactsX extends CordovaPlugin {
     }
 
     private JSONArray handleFindResult(Cursor contactsCursor, ContactsXFindOptions options) throws JSONException {
-        // initialize array
+
         JSONArray jsContacts = new JSONArray();
 
         if (contactsCursor != null && contactsCursor.getCount() > 0) {
@@ -274,7 +372,7 @@ public class ContactsX extends CordovaPlugin {
                             String organizationName = contactsCursor.getString(contactsCursor.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Organization.COMPANY));
                             jsContact.put("organizationName", organizationName);
                         }
-                        break;    
+                        break;
                     case ContactsContract.CommonDataKinds.StructuredName.CONTENT_ITEM_TYPE:
                         try {
                             if (options.firstName) {
@@ -464,7 +562,7 @@ public class ContactsX extends CordovaPlugin {
         } else {
             LOG.d(LOG_TAG, "All \"name\" properties are empty");
         }
-        
+
         // Add organizationName
         String organizationName = getJsonString(contact, "organizationName");
         if(organizationName != null){
@@ -868,4 +966,21 @@ public class ContactsX extends CordovaPlugin {
         }
         return type;
     }
+    static class WhereOptions {
+        private String where;
+        private String[] whereArgs;
+        public void setWhere(String where) {
+            this.where = where;
+        }
+        public String getWhere() {
+            return where;
+        }
+        public void setWhereArgs(String[] whereArgs) {
+            this.whereArgs = whereArgs;
+        }
+        public String[] getWhereArgs() {
+            return whereArgs;
+        }
+    }
 }
+
